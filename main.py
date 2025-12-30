@@ -13,100 +13,95 @@ def get_db_connection():
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-# --- 1. SETUP DO BANCO (V2.0 - COM NOVAS TABELAS) ---
+# --- 1. SETUP BLINDADO (FORÇA ATUALIZAÇÃO) ---
 @app.route("/setup_banco", methods=["GET"])
 def setup_db():
+    log_msgs = []
     try:
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # A. TABELA USUARIOS
+        # 1. Cria tabelas base se não existirem
         cur.execute("""
             CREATE TABLE IF NOT EXISTS usuarios (
                 id SERIAL PRIMARY KEY,
                 nome TEXT,
                 email TEXT UNIQUE,
                 senha TEXT,
-                funcao TEXT, -- 'admin' ou 'vendedor'
+                funcao TEXT,
                 ativo BOOLEAN DEFAULT TRUE
             );
         """)
-
-        # B. TABELA CONTATOS (Atualizada com Notas e Códigos)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS contatos (
                 id SERIAL PRIMARY KEY,
                 whatsapp_id TEXT UNIQUE NOT NULL,
                 nome TEXT,
-                status_atendimento TEXT DEFAULT 'fila', -- 'fila', 'em_andamento', 'encerrado'
-                vendedora_id INTEGER REFERENCES usuarios(id),
-                codigo_cliente TEXT, -- Novo: (567946)
-                cpf_cnpj TEXT,       -- Novo
-                notas_internas TEXT, -- Novo: "Cliente bravo", etc
+                status_atendimento TEXT DEFAULT 'fila',
                 ultima_interacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        
-        # Adiciona colunas novas caso a tabela já exista (Migração)
-        colunas_novas = [
-            ("codigo_cliente", "TEXT"),
-            ("cpf_cnpj", "TEXT"),
-            ("notas_internas", "TEXT"),
-            ("vendedora_id", "INTEGER REFERENCES usuarios(id)")
-        ]
-        for col, tipo in colunas_novas:
-            try:
-                cur.execute(f"ALTER TABLE contatos ADD COLUMN {col} {tipo};")
-            except:
-                conn.rollback()
-        
-        # C. TABELA MENSAGENS (Suporte a Mídia e Custo)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS mensagens (
                 id SERIAL PRIMARY KEY,
                 contato_id INTEGER REFERENCES contatos(id),
                 remetente TEXT,
-                texto TEXT, -- Se for mídia, aqui vai a legenda ou vazio
-                tipo TEXT DEFAULT 'text', -- 'text', 'image', 'audio', 'document', 'template'
-                url_media TEXT, -- ID da mídia na Meta ou URL
-                custo NUMERIC(10, 4) DEFAULT 0.0, -- Custo do disparo
+                texto TEXT,
                 mensagem_id_meta TEXT,
                 data_envio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
-        # Migração Mensagens
-        try:
-            cur.execute("ALTER TABLE mensagens ADD COLUMN tipo TEXT DEFAULT 'text';")
-            cur.execute("ALTER TABLE mensagens ADD COLUMN url_media TEXT;")
-            cur.execute("ALTER TABLE mensagens ADD COLUMN custo NUMERIC(10, 4) DEFAULT 0.0;")
-        except:
-            conn.rollback()
-
-        # D. TABELA RESPOSTAS RÁPIDAS (NOVO!)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS respostas_rapidas (
                 id SERIAL PRIMARY KEY,
                 titulo TEXT,
                 texto TEXT,
-                criado_por INTEGER REFERENCES usuarios(id) -- Se NULL, é global
+                criado_por INTEGER REFERENCES usuarios(id)
             );
         """)
+        conn.commit()
+        log_msgs.append("Tabelas Base verificadas.")
 
-        # E. ADMIN PADRÃO
+        # 2. LISTA DE COLUNAS NOVAS PARA FORÇAR A CRIAÇÃO
+        # Formato: (Tabela, Coluna, Tipo)
+        colunas_para_adicionar = [
+            ("contatos", "codigo_cliente", "TEXT"),
+            ("contatos", "cpf_cnpj", "TEXT"),
+            ("contatos", "notas_internas", "TEXT"),
+            ("contatos", "vendedora_id", "INTEGER REFERENCES usuarios(id)"),
+            ("mensagens", "tipo", "TEXT DEFAULT 'text'"),
+            ("mensagens", "url_media", "TEXT"),
+            ("mensagens", "custo", "NUMERIC(10, 4) DEFAULT 0.0")
+        ]
+
+        # Tenta criar cada coluna individualmente
+        for tabela, coluna, tipo in colunas_para_adicionar:
+            try:
+                cur.execute(f"ALTER TABLE {tabela} ADD COLUMN {coluna} {tipo};")
+                conn.commit()
+                log_msgs.append(f"✅ Coluna '{coluna}' criada em '{tabela}'.")
+            except Exception as e:
+                conn.rollback() # Ignora erro se já existir
+                # log_msgs.append(f"ℹ️ Coluna '{coluna}' já existia.")
+
+        # 3. Cria Admin se não existir
         cur.execute("""
             INSERT INTO usuarios (nome, email, senha, funcao)
             VALUES ('Administrador', 'admin@sempre.com', '123', 'admin')
             ON CONFLICT (email) DO NOTHING;
         """)
-        
         conn.commit()
+        
         cur.close()
         conn.close()
-        return "✅ SUCESSO! Banco V2.0 Atualizado (Notas, Mídia, Respostas Rápidas e Custos).", 200
-    except Exception as e:
-        return f"Erro ao configurar banco: {str(e)}", 500
+        
+        # Retorna o relatório do que foi feito
+        return jsonify({"status": "Sucesso", "log": log_msgs}), 200
 
-# --- 2. WEBHOOK (INTELIGÊNCIA DE RECEBIMENTO) ---
+    except Exception as e:
+        return f"Erro Crítico no Banco: {str(e)}", 500
+
+# --- 2. WEBHOOK (IGUAL ANTES) ---
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -132,7 +127,7 @@ def receive_message():
             msg_id = msg_data['id']
             contact_name = value['contacts'][0]['profile']['name']
             
-            # --- IDENTIFICA O TIPO DE MENSAGEM ---
+            # Tipo de mensagem
             msg_type = msg_data['type']
             texto = ""
             media_id = None
@@ -141,22 +136,19 @@ def receive_message():
                 texto = msg_data['text']['body']
             elif msg_type == 'button':
                 texto = msg_data['button']['text']
-            elif msg_type in ['image', 'audio', 'voice', 'video', 'document', 'sticker']:
-                # Pega o ID da mídia para baixar depois no Frontend
+            elif msg_type in ['image', 'audio', 'voice', 'video', 'document']:
                 media_id = msg_data[msg_type]['id']
-                # Se tiver legenda (caption), salva no texto
                 texto = msg_data[msg_type].get('caption', f"[{msg_type}]")
             else:
-                texto = f"[{msg_type} - Não suportado]"
+                texto = f"[{msg_type}]"
 
-            # Normaliza voice para audio
             db_type = 'audio' if msg_type == 'voice' else msg_type
 
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # 1. Atualiza Contato (Reabre se estiver encerrado?)
-            # Por enquanto, se o cliente manda msg, volta para 'fila' se estava 'encerrado'
+            # Salva Contato (Garante que as colunas novas não quebrem o INSERT)
+            # Se der erro aqui, é pq a coluna não existe, mas o setup_banco deve resolver
             cur.execute("""
                 INSERT INTO contatos (whatsapp_id, nome, ultima_interacao)
                 VALUES (%s, %s, CURRENT_TIMESTAMP)
@@ -173,7 +165,7 @@ def receive_message():
             
             contato_id = cur.fetchone()[0]
 
-            # 2. Salva Mensagem
+            # Salva Mensagem
             cur.execute("""
                 INSERT INTO mensagens (contato_id, remetente, texto, tipo, url_media, mensagem_id_meta)
                 VALUES (%s, 'cliente', %s, %s, %s, %s)
@@ -182,7 +174,7 @@ def receive_message():
             conn.commit()
             cur.close()
             conn.close()
-            print(f"✅ Msg de {contact_name} ({db_type}) salva.")
+            print(f"✅ Msg salva: {texto}")
 
     except Exception as e:
         print(f"⚠️ Erro Webhook: {e}")
