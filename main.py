@@ -1,7 +1,7 @@
 from flask import Flask, request, jsonify
 import os
 import psycopg2
-import requests # Importante para o robô enviar msg
+import requests
 from datetime import datetime
 
 app = Flask(__name__)
@@ -9,46 +9,33 @@ app = Flask(__name__)
 # --- CONFIGURAÇÕES ---
 VERIFY_TOKEN = "sempreinternet_segredo_123"
 DATABASE_URL = os.environ.get("DATABASE_URL")
-# Precisamos do Token aqui para o Robô responder sozinho
-META_TOKEN = os.environ.get("META_TOKEN") # Opcional: Pegar das envs se tiver, ou hardcode abaixo
-# Se não configurou META_TOKEN nas variáveis de ambiente do Render, 
-# o robô não conseguirá enviar. Mas o app.py continuará funcionando.
 
 def get_db_connection():
     conn = psycopg2.connect(DATABASE_URL)
     return conn
 
-# --- FUNÇÃO AUXILIAR: ENVIAR MENSAGEM (ROBÔ) ---
+# --- FUNÇÃO AUXILIAR: ROBÔ ---
 def enviar_mensagem_robo(telefone, texto):
-    # Tenta pegar credenciais do banco ou variaveis (Simplificado: Hardcode ou Env)
-    # Para facilitar, vamos assumir que você vai configurar META_TOKEN e META_PHONE_ID 
-    # nas "Environment Variables" do Render, igual fez no Streamlit.
     token = os.environ.get("META_TOKEN") 
-    phone_id = os.environ.get("META_PHONE_ID", "908486432354190")
+    phone_id = os.environ.get("META_PHONE_ID")
     
-    if not token: 
-        print("⚠️ Robô sem Token configurado no Render. Mensagem não enviada.")
+    if not token or not phone_id: 
+        print("⚠️ Variáveis de Ambiente META_TOKEN ou META_PHONE_ID não configuradas no Render.")
         return
 
     url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     
-    # Tratamento telefone
     tel = ''.join(filter(str.isdigit, str(telefone)))
     if len(tel) == 13 and tel.startswith("55"): tel = tel[:4] + tel[5:]
     
-    data = {
-        "messaging_product": "whatsapp",
-        "to": tel,
-        "type": "text",
-        "text": {"body": texto}
-    }
+    data = {"messaging_product": "whatsapp", "to": tel, "type": "text", "text": {"body": texto}}
     try:
         requests.post(url, headers=headers, json=data)
     except Exception as e:
         print(f"Erro envio robô: {e}")
 
-# --- 1. SETUP DO BANCO (V3.0) ---
+# --- 1. SETUP DO BANCO (CORREÇÃO FORÇADA) ---
 @app.route("/setup_banco", methods=["GET"])
 def setup_db():
     log = []
@@ -56,7 +43,11 @@ def setup_db():
         conn = get_db_connection()
         cur = conn.cursor()
         
-        # Tabelas Base
+        # ⚠️ APAGA A TABELA DEFEITUOSA PARA RECRIAR CORRETAMENTE
+        cur.execute("DROP TABLE IF EXISTS configuracoes;")
+        log.append("🗑️ Tabela antiga 'configuracoes' apagada.")
+
+        # Recria tabelas base
         cur.execute("""
             CREATE TABLE IF NOT EXISTS usuarios (
                 id SERIAL PRIMARY KEY,
@@ -94,22 +85,24 @@ def setup_db():
                 criado_por INTEGER REFERENCES usuarios(id)
             );
         """)
-        # NOVA TABELA: CONFIGURAÇÕES (Para guardar a Saudação)
+
+        # AGORA CRIA A TABELA CERTA (COM PRIMARY KEY)
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS configuracoes (
+            CREATE TABLE configuracoes (
                 chave TEXT PRIMARY KEY,
                 valor TEXT
             );
         """)
-        # Insere saudação padrão se não existir
+        
+        # Insere valor padrão
         cur.execute("""
             INSERT INTO configuracoes (chave, valor) 
-            VALUES ('msg_boas_vindas', 'Olá! Bem-vindo à Sempre Internet. Um atendente falará com você em instantes.')
+            VALUES ('msg_boas_vindas', 'Olá! Bem-vindo. Um atendente falará com você em instantes.')
             ON CONFLICT (chave) DO NOTHING;
         """)
-        log.append("Tabela Configurações criada.")
+        log.append("✅ Tabela 'configuracoes' recriada com sucesso.")
 
-        # Força colunas novas (caso V2 não tenha rodado)
+        # Garante colunas
         cols = [
             ("contatos", "codigo_cliente", "TEXT"),
             ("contatos", "cpf_cnpj", "TEXT"),
@@ -123,21 +116,20 @@ def setup_db():
             try:
                 cur.execute(f"ALTER TABLE {tab} ADD COLUMN {col} {tipo};")
                 conn.commit()
-                log.append(f"Coluna {col} ok.")
             except:
                 conn.rollback()
 
-        # Admin Padrão
+        # Garante Admin
         cur.execute("INSERT INTO usuarios (nome, email, senha, funcao) VALUES ('Admin', 'admin@sempre.com', '123', 'admin') ON CONFLICT (email) DO NOTHING;")
         conn.commit()
         
         cur.close()
         conn.close()
-        return jsonify({"status": "Sucesso V3", "log": log}), 200
+        return jsonify({"status": "CORREÇÃO APLICADA", "log": log}), 200
     except Exception as e:
-        return f"Erro: {str(e)}", 500
+        return f"Erro Crítico: {str(e)}", 500
 
-# --- 2. WEBHOOK INTELIGENTE ---
+# --- 2. WEBHOOK ---
 @app.route("/webhook", methods=["GET"])
 def verify_webhook():
     mode = request.args.get("hub.mode")
@@ -162,7 +154,6 @@ def receive_message():
             msg_id = msg_data['id']
             contact_name = value['contacts'][0]['profile']['name']
             
-            # Tipo msg
             tipo = msg_data['type']
             texto = ""
             media_id = None
@@ -177,24 +168,18 @@ def receive_message():
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # LÓGICA DO ROBÔ: Verifica status ATUAL antes de atualizar
+            # LÓGICA DO ROBÔ
             cur.execute("SELECT status_atendimento FROM contatos WHERE whatsapp_id = %s", (phone,))
             resultado = cur.fetchone()
             
             deve_saudar = False
-            status_atual = None
             
             if not resultado:
-                # Cliente Novo (Nunca falou antes)
                 deve_saudar = True
-                status_atual = 'fila'
-            else:
-                status_atual = resultado[0]
-                if status_atual == 'encerrado':
-                    # Cliente voltando
-                    deve_saudar = True
+            elif resultado[0] == 'encerrado':
+                deve_saudar = True
             
-            # Atualiza/Cria Contato (Trazendo para fila)
+            # Upsert Contato
             cur.execute("""
                 INSERT INTO contatos (whatsapp_id, nome, ultima_interacao, status_atendimento)
                 VALUES (%s, %s, CURRENT_TIMESTAMP, 'fila')
@@ -202,34 +187,31 @@ def receive_message():
                 DO UPDATE SET 
                     nome = EXCLUDED.nome, 
                     ultima_interacao = CURRENT_TIMESTAMP,
-                    status_atendimento = 'fila' -- Sempre reabre se mandar msg
+                    status_atendimento = 'fila'
                 RETURNING id;
             """, (phone, contact_name))
             contato_id = cur.fetchone()[0]
 
-            # Salva Mensagem do Cliente
+            # Salva Mensagem
             cur.execute("""
                 INSERT INTO mensagens (contato_id, remetente, texto, tipo, url_media, mensagem_id_meta)
                 VALUES (%s, 'cliente', %s, %s, %s, %s)
             """, (contato_id, texto, db_type, media_id, msg_id))
 
-            # DISPARA SAUDAÇÃO SE NECESSÁRIO
+            # Dispara Saudação
             if deve_saudar:
-                # Busca mensagem configurada
-                cur.execute("SELECT valor FROM configuracoes WHERE chave='msg_boas_vindas'")
-                res_config = cur.fetchone()
-                msg_saudacao = res_config[0] if res_config else "Olá!"
-                
-                if msg_saudacao and msg_saudacao.strip() != "":
-                    # Envia no Zap (via requests)
-                    enviar_mensagem_robo(phone, msg_saudacao)
+                # Agora a tabela configuracoes vai existir, então isso não vai dar erro!
+                try:
+                    cur.execute("SELECT valor FROM configuracoes WHERE chave='msg_boas_vindas'")
+                    res_config = cur.fetchone()
+                    msg_saudacao = res_config[0] if res_config else "Olá! Bem-vindo."
                     
-                    # Salva no histórico como 'empresa' (automático)
-                    cur.execute("""
-                        INSERT INTO mensagens (contato_id, remetente, texto, tipo)
-                        VALUES (%s, 'empresa', %s, 'text')
-                    """, (contato_id, msg_saudacao))
-                    print(f"🤖 Robô saudou {contact_name}")
+                    if msg_saudacao:
+                        enviar_mensagem_robo(phone, msg_saudacao)
+                        cur.execute("INSERT INTO mensagens (contato_id, remetente, texto, tipo) VALUES (%s, 'empresa', %s, 'text')", (contato_id, msg_saudacao))
+                        print(f"🤖 Robô enviou: {msg_saudacao}")
+                except Exception as e:
+                    print(f"Erro ao buscar saudação: {e}")
 
             conn.commit()
             cur.close()
