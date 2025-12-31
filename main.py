@@ -20,7 +20,7 @@ def enviar_mensagem_robo(telefone, texto):
     phone_id = os.environ.get("META_PHONE_ID")
     
     if not token or not phone_id: 
-        print("⚠️ Variáveis de Ambiente META_TOKEN ou META_PHONE_ID não configuradas.")
+        print("⚠️ Variáveis META_TOKEN/META_PHONE_ID não configuradas.")
         return
 
     url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
@@ -35,7 +35,7 @@ def enviar_mensagem_robo(telefone, texto):
     except Exception as e:
         print(f"Erro envio robô: {e}")
 
-# --- 1. SETUP DO BANCO (ATUALIZADO PARA TEMPLATES) ---
+# --- 1. SETUP DO BANCO (V7.1 - Com Custo nos Templates) ---
 @app.route("/setup_banco", methods=["GET"])
 def setup_db():
     log = []
@@ -44,69 +44,18 @@ def setup_db():
         cur = conn.cursor()
         
         # Tabelas Base
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS usuarios (
-                id SERIAL PRIMARY KEY,
-                nome TEXT,
-                email TEXT UNIQUE,
-                senha TEXT,
-                funcao TEXT,
-                ativo BOOLEAN DEFAULT TRUE
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS contatos (
-                id SERIAL PRIMARY KEY,
-                whatsapp_id TEXT UNIQUE NOT NULL,
-                nome TEXT,
-                status_atendimento TEXT DEFAULT 'fila',
-                ultima_interacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS mensagens (
-                id SERIAL PRIMARY KEY,
-                contato_id INTEGER REFERENCES contatos(id),
-                remetente TEXT,
-                texto TEXT,
-                mensagem_id_meta TEXT,
-                data_envio TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS respostas_rapidas (
-                id SERIAL PRIMARY KEY,
-                titulo TEXT,
-                texto TEXT,
-                criado_por INTEGER REFERENCES usuarios(id)
-            );
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS configuracoes (
-                chave TEXT PRIMARY KEY,
-                valor TEXT
-            );
-        """)
+        cur.execute("""CREATE TABLE IF NOT EXISTS usuarios (id SERIAL PRIMARY KEY, nome TEXT, email TEXT UNIQUE, senha TEXT, funcao TEXT, ativo BOOLEAN DEFAULT TRUE);""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS contatos (id SERIAL PRIMARY KEY, whatsapp_id TEXT UNIQUE NOT NULL, nome TEXT, status_atendimento TEXT DEFAULT 'fila', ultima_interacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP, codigo_cliente TEXT, cpf_cnpj TEXT, notas_internas TEXT, vendedora_id INTEGER REFERENCES usuarios(id));""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS mensagens (id SERIAL PRIMARY KEY, contato_id INTEGER REFERENCES contatos(id), remetente TEXT, texto TEXT, tipo TEXT DEFAULT 'text', url_media TEXT, custo NUMERIC(10, 4) DEFAULT 0.0, mensagem_id_meta TEXT, data_envio TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS respostas_rapidas (id SERIAL PRIMARY KEY, titulo TEXT, texto TEXT, criado_por INTEGER REFERENCES usuarios(id));""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT);""")
         
-        # --- NOVA TABELA: TEMPLATES ---
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS templates (
-                id SERIAL PRIMARY KEY,
-                nome_tecnico TEXT UNIQUE NOT NULL, -- O nome exato da Meta (ex: hello_world)
-                idioma TEXT DEFAULT 'pt_BR'
-            );
-        """)
-        log.append("Tabela 'templates' verificada.")
-
-        # Insere valor padrão
-        cur.execute("""
-            INSERT INTO configuracoes (chave, valor) 
-            VALUES ('msg_boas_vindas', 'Olá! Bem-vindo. Um atendente falará com você em instantes.')
-            ON CONFLICT (chave) DO NOTHING;
-        """)
-
-        # Garante colunas
+        # TABELA TEMPLATES COM CUSTO
+        cur.execute("""CREATE TABLE IF NOT EXISTS templates (id SERIAL PRIMARY KEY, nome_tecnico TEXT UNIQUE NOT NULL, idioma TEXT DEFAULT 'pt_BR', custo_estimado NUMERIC(10,4) DEFAULT 0.0);""")
+        
+        # Garante colunas novas (Migração automática)
         cols = [
+            ("templates", "custo_estimado", "NUMERIC(10,4) DEFAULT 0.05"), # Garante que a coluna exista
             ("contatos", "codigo_cliente", "TEXT"),
             ("contatos", "cpf_cnpj", "TEXT"),
             ("contatos", "notas_internas", "TEXT"),
@@ -122,15 +71,16 @@ def setup_db():
             except:
                 conn.rollback()
 
-        # Garante Admin
+        # Dados Padrão
         cur.execute("INSERT INTO usuarios (nome, email, senha, funcao) VALUES ('Admin', 'admin@sempre.com', '123', 'admin') ON CONFLICT (email) DO NOTHING;")
-        conn.commit()
+        cur.execute("INSERT INTO configuracoes (chave, valor) VALUES ('msg_boas_vindas', 'Olá! Bem-vindo. Um atendente falará com você em instantes.') ON CONFLICT (chave) DO NOTHING;")
         
+        conn.commit()
         cur.close()
         conn.close()
-        return jsonify({"status": "Sucesso V4 (Templates)", "log": log}), 200
+        return jsonify({"status": "ONLINE", "msg": "Banco V7.1 (Templates com Custo) Verificado."}), 200
     except Exception as e:
-        return f"Erro Crítico: {str(e)}", 500
+        return f"Erro Setup: {str(e)}", 500
 
 # --- 2. WEBHOOK ---
 @app.route("/webhook", methods=["GET"])
@@ -171,7 +121,6 @@ def receive_message():
             conn = get_db_connection()
             cur = conn.cursor()
 
-            # LÓGICA DO ROBÔ
             cur.execute("SELECT status_atendimento FROM contatos WHERE whatsapp_id = %s", (phone,))
             resultado = cur.fetchone()
             
@@ -197,12 +146,11 @@ def receive_message():
                 try:
                     cur.execute("SELECT valor FROM configuracoes WHERE chave='msg_boas_vindas'")
                     res_config = cur.fetchone()
-                    msg_saudacao = res_config[0] if res_config else "Olá! Bem-vindo."
+                    msg_saudacao = res_config[0] if res_config else ""
                     if msg_saudacao:
                         enviar_mensagem_robo(phone, msg_saudacao)
                         cur.execute("INSERT INTO mensagens (contato_id, remetente, texto, tipo) VALUES (%s, 'empresa', %s, 'text')", (contato_id, msg_saudacao))
-                except Exception as e:
-                    print(f"Erro saudação: {e}")
+                except Exception as e: print(f"Erro saudação: {e}")
 
             conn.commit()
             cur.close()
