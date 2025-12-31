@@ -35,10 +35,9 @@ def enviar_mensagem_robo(telefone, texto):
     except Exception as e:
         print(f"Erro envio robô: {e}")
 
-# --- 1. SETUP DO BANCO (V7.1 - Com Custo nos Templates) ---
+# --- 1. SETUP DO BANCO (V8.0 - Com Bloqueio Admin) ---
 @app.route("/setup_banco", methods=["GET"])
 def setup_db():
-    log = []
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -49,20 +48,19 @@ def setup_db():
         cur.execute("""CREATE TABLE IF NOT EXISTS mensagens (id SERIAL PRIMARY KEY, contato_id INTEGER REFERENCES contatos(id), remetente TEXT, texto TEXT, tipo TEXT DEFAULT 'text', url_media TEXT, custo NUMERIC(10, 4) DEFAULT 0.0, mensagem_id_meta TEXT, data_envio TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
         cur.execute("""CREATE TABLE IF NOT EXISTS respostas_rapidas (id SERIAL PRIMARY KEY, titulo TEXT, texto TEXT, criado_por INTEGER REFERENCES usuarios(id));""")
         cur.execute("""CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT);""")
-        
-        # TABELA TEMPLATES COM CUSTO
         cur.execute("""CREATE TABLE IF NOT EXISTS templates (id SERIAL PRIMARY KEY, nome_tecnico TEXT UNIQUE NOT NULL, idioma TEXT DEFAULT 'pt_BR', custo_estimado NUMERIC(10,4) DEFAULT 0.0);""")
         
-        # Garante colunas novas (Migração automática)
+        # MIGRAÇÕES AUTOMÁTICAS (Adiciona colunas se não existirem)
         cols = [
-            ("templates", "custo_estimado", "NUMERIC(10,4) DEFAULT 0.05"), # Garante que a coluna exista
+            ("templates", "custo_estimado", "NUMERIC(10,4) DEFAULT 0.05"),
             ("contatos", "codigo_cliente", "TEXT"),
             ("contatos", "cpf_cnpj", "TEXT"),
             ("contatos", "notas_internas", "TEXT"),
             ("contatos", "vendedora_id", "INTEGER REFERENCES usuarios(id)"),
             ("mensagens", "tipo", "TEXT DEFAULT 'text'"),
             ("mensagens", "url_media", "TEXT"),
-            ("mensagens", "custo", "NUMERIC(10, 4) DEFAULT 0.0")
+            ("mensagens", "custo", "NUMERIC(10, 4) DEFAULT 0.0"),
+            ("usuarios", "bloqueado_envio", "BOOLEAN DEFAULT FALSE") # NOVA COLUNA DE BLOQUEIO
         ]
         for tab, col, tipo in cols:
             try:
@@ -78,7 +76,7 @@ def setup_db():
         conn.commit()
         cur.close()
         conn.close()
-        return jsonify({"status": "ONLINE", "msg": "Banco V7.1 (Templates com Custo) Verificado."}), 200
+        return jsonify({"status": "ONLINE", "msg": "Banco V8.0 (Bloqueio Admin) Verificado."}), 200
     except Exception as e:
         return f"Erro Setup: {str(e)}", 500
 
