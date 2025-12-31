@@ -19,9 +19,7 @@ def enviar_mensagem_robo(telefone, texto):
     token = os.environ.get("META_TOKEN") 
     phone_id = os.environ.get("META_PHONE_ID")
     
-    if not token or not phone_id: 
-        print("⚠️ Variáveis META_TOKEN/META_PHONE_ID não configuradas.")
-        return
+    if not token or not phone_id: return
 
     url = f"https://graph.facebook.com/v18.0/{phone_id}/messages"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -35,7 +33,7 @@ def enviar_mensagem_robo(telefone, texto):
     except Exception as e:
         print(f"Erro envio robô: {e}")
 
-# --- 1. SETUP DO BANCO (V8.0 - Com Bloqueio Admin) ---
+# --- 1. SETUP DO BANCO (V10.0 - Com Regras de Bot) ---
 @app.route("/setup_banco", methods=["GET"])
 def setup_db():
     try:
@@ -43,14 +41,17 @@ def setup_db():
         cur = conn.cursor()
         
         # Tabelas Base
-        cur.execute("""CREATE TABLE IF NOT EXISTS usuarios (id SERIAL PRIMARY KEY, nome TEXT, email TEXT UNIQUE, senha TEXT, funcao TEXT, ativo BOOLEAN DEFAULT TRUE);""")
+        cur.execute("""CREATE TABLE IF NOT EXISTS usuarios (id SERIAL PRIMARY KEY, nome TEXT, email TEXT UNIQUE, senha TEXT, funcao TEXT, ativo BOOLEAN DEFAULT TRUE, bloqueado_envio BOOLEAN DEFAULT FALSE);""")
         cur.execute("""CREATE TABLE IF NOT EXISTS contatos (id SERIAL PRIMARY KEY, whatsapp_id TEXT UNIQUE NOT NULL, nome TEXT, status_atendimento TEXT DEFAULT 'fila', ultima_interacao TIMESTAMP DEFAULT CURRENT_TIMESTAMP, codigo_cliente TEXT, cpf_cnpj TEXT, notas_internas TEXT, vendedora_id INTEGER REFERENCES usuarios(id));""")
         cur.execute("""CREATE TABLE IF NOT EXISTS mensagens (id SERIAL PRIMARY KEY, contato_id INTEGER REFERENCES contatos(id), remetente TEXT, texto TEXT, tipo TEXT DEFAULT 'text', url_media TEXT, custo NUMERIC(10, 4) DEFAULT 0.0, mensagem_id_meta TEXT, data_envio TIMESTAMP DEFAULT CURRENT_TIMESTAMP);""")
         cur.execute("""CREATE TABLE IF NOT EXISTS respostas_rapidas (id SERIAL PRIMARY KEY, titulo TEXT, texto TEXT, criado_por INTEGER REFERENCES usuarios(id));""")
         cur.execute("""CREATE TABLE IF NOT EXISTS configuracoes (chave TEXT PRIMARY KEY, valor TEXT);""")
         cur.execute("""CREATE TABLE IF NOT EXISTS templates (id SERIAL PRIMARY KEY, nome_tecnico TEXT UNIQUE NOT NULL, idioma TEXT DEFAULT 'pt_BR', custo_estimado NUMERIC(10,4) DEFAULT 0.0);""")
         
-        # MIGRAÇÕES AUTOMÁTICAS (Adiciona colunas se não existirem)
+        # NOVA TABELA DE REGRAS DO BOT
+        cur.execute("""CREATE TABLE IF NOT EXISTS bot_regras (id SERIAL PRIMARY KEY, template_gatilho TEXT UNIQUE, resposta_texto TEXT);""")
+
+        # MIGRAÇÕES (Adiciona colunas se faltar)
         cols = [
             ("templates", "custo_estimado", "NUMERIC(10,4) DEFAULT 0.05"),
             ("contatos", "codigo_cliente", "TEXT"),
@@ -60,7 +61,8 @@ def setup_db():
             ("mensagens", "tipo", "TEXT DEFAULT 'text'"),
             ("mensagens", "url_media", "TEXT"),
             ("mensagens", "custo", "NUMERIC(10, 4) DEFAULT 0.0"),
-            ("usuarios", "bloqueado_envio", "BOOLEAN DEFAULT FALSE") # NOVA COLUNA DE BLOQUEIO
+            ("usuarios", "bloqueado_envio", "BOOLEAN DEFAULT FALSE"),
+            ("contatos", "contexto_bot", "TEXT") # Nova coluna para saber qual foi o ultimo template
         ]
         for tab, col, tipo in cols:
             try:
@@ -76,7 +78,7 @@ def setup_db():
         conn.commit()
         cur.close()
         conn.close()
-        return jsonify({"status": "ONLINE", "msg": "Banco V8.0 (Bloqueio Admin) Verificado."}), 200
+        return jsonify({"status": "ONLINE", "msg": "Banco V10.0 (Bot Contextual) Verificado."}), 200
     except Exception as e:
         return f"Erro Setup: {str(e)}", 500
 
@@ -119,28 +121,62 @@ def receive_message():
             conn = get_db_connection()
             cur = conn.cursor()
 
-            cur.execute("SELECT status_atendimento FROM contatos WHERE whatsapp_id = %s", (phone,))
-            resultado = cur.fetchone()
+            # Verifica Contato e Contexto Atual
+            cur.execute("SELECT id, status_atendimento, contexto_bot FROM contatos WHERE whatsapp_id = %s", (phone,))
+            res_contato = cur.fetchone()
             
             deve_saudar = False
-            if not resultado: deve_saudar = True
-            elif resultado[0] == 'encerrado': deve_saudar = True
             
-            cur.execute("""
-                INSERT INTO contatos (whatsapp_id, nome, ultima_interacao, status_atendimento)
-                VALUES (%s, %s, CURRENT_TIMESTAMP, 'fila')
-                ON CONFLICT (whatsapp_id) 
-                DO UPDATE SET nome = EXCLUDED.nome, ultima_interacao = CURRENT_TIMESTAMP, status_atendimento = 'fila'
-                RETURNING id;
-            """, (phone, contact_name))
-            contato_id = cur.fetchone()[0]
+            if not res_contato:
+                # Novo contato
+                cur.execute("""
+                    INSERT INTO contatos (whatsapp_id, nome, ultima_interacao, status_atendimento)
+                    VALUES (%s, %s, CURRENT_TIMESTAMP, 'fila')
+                    RETURNING id
+                """, (phone, contact_name))
+                contato_id = cur.fetchone()[0]
+                contexto_atual = None
+                deve_saudar = True
+            else:
+                contato_id = res_contato[0]
+                status_atual = res_contato[1]
+                contexto_atual = res_contato[2]
+                
+                # Atualiza nome e data
+                cur.execute("UPDATE contatos SET nome=%s, ultima_interacao=CURRENT_TIMESTAMP WHERE id=%s", (contact_name, contato_id))
+                
+                if status_atual == 'encerrado': 
+                    cur.execute("UPDATE contatos SET status_atendimento='fila' WHERE id=%s", (contato_id,))
+                    deve_saudar = True
 
+            # Grava a mensagem do cliente
             cur.execute("""
                 INSERT INTO mensagens (contato_id, remetente, texto, tipo, url_media, mensagem_id_meta)
                 VALUES (%s, 'cliente', %s, %s, %s, %s)
             """, (contato_id, texto, db_type, media_id, msg_id))
 
-            if deve_saudar:
+            # --- LÓGICA DO ROBÔ INTELIGENTE ---
+            bot_respondeu = False
+            
+            # 1. Verifica se tem um Contexto (Respondendo a um template específico)
+            if contexto_atual:
+                cur.execute("SELECT resposta_texto FROM bot_regras WHERE template_gatilho = %s", (contexto_atual,))
+                regra = cur.fetchone()
+                
+                if regra:
+                    resposta_bot = regra[0]
+                    enviar_mensagem_robo(phone, resposta_bot)
+                    cur.execute("INSERT INTO mensagens (contato_id, remetente, texto, tipo) VALUES (%s, 'empresa', %s, 'text')", (contato_id, resposta_bot))
+                    bot_respondeu = True
+                    
+                    # Limpa o contexto para não responder de novo na proxima
+                    cur.execute("UPDATE contatos SET contexto_bot = NULL WHERE id = %s", (contato_id,))
+                else:
+                    # Tinha contexto mas nao tinha regra, limpa contexto
+                    cur.execute("UPDATE contatos SET contexto_bot = NULL WHERE id = %s", (contato_id,))
+
+            # 2. Se o bot contextual NÃO respondeu, manda a saudação padrão se necessário
+            if not bot_respondeu and deve_saudar:
                 try:
                     cur.execute("SELECT valor FROM configuracoes WHERE chave='msg_boas_vindas'")
                     res_config = cur.fetchone()
